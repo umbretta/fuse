@@ -209,7 +209,7 @@
     <p class="psub">Your progress is saved on this device. To carry it over, make a player on the other device and load this code there.</p>
     <div class="coderow"><code id="pcode"></code><button class="btn alt" id="pcopy" type="button">Copy</button></div>
     <form id="lform" class="coderow" autocomplete="off">
-      <input id="lcode" maxlength="9" placeholder="Code from another device" aria-label="Transfer code">
+      <input id="lcode" maxlength="16" placeholder="Code from another device" aria-label="Transfer code">
       <button class="btn alt" type="submit">Load</button>
     </form>
     <p class="pmsg" id="lmsg"></p>
@@ -506,7 +506,17 @@ function loadProfiles() {
   me = profiles.list.find(p => p.id === profiles.active) || profiles.list[0] || null;
   if (me) { profiles.active = me.id; adopt(me); }
 }
-function adopt(p) { best = Math.min(MAX_LEVEL, Math.max(0, p.best | 0)); level = Math.min(Math.max(1, p.level | 0), best + 1, MAX_LEVEL); }
+// admin players can open any level; everyone else up to one past the last level they beat
+const reach = () => me && me.admin ? MAX_LEVEL : Math.min(best + 1, MAX_LEVEL);
+function adopt(p) { best = Math.min(MAX_LEVEL, Math.max(0, p.best | 0)); level = Math.min(Math.max(1, p.level | 0), p.admin ? MAX_LEVEL : best + 1, MAX_LEVEL); }
+// the admin key itself is not in this file, only its SHA-256
+const ADMIN_HASH = '1971707986413d1f4379f4e4b98cfd17295163dc4c3e21fecc8cb28eff0b76fd';
+async function isAdminKey(str) {
+  const s = str.toUpperCase().replace(/[^0-9A-Z]/g, '');
+  if (s.length !== 10 || !(window.crypto && crypto.subtle)) return false;
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('fuse-admin:' + s));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('') === ADMIN_HASH;
+}
 function saveProfiles() {
   if (me) { me.level = level; me.best = best; }
   try { localStorage.setItem(KEY + '.profiles', JSON.stringify(profiles)); } catch (e) {}
@@ -613,7 +623,7 @@ function startLevel(tip) {
 }
 function win(title) {
   sfx.win();
-  if (level > best) best = level;
+  if (level === best + 1) best = level; // levels beaten in order (an admin playing ahead keeps their real progress)
   saveProfiles();
   for (let i = 0; i < 7; i++) setTimeout(() => burst(rnd(40, innerWidth - 40), rnd(80, innerHeight * .6), PALETTE[i % PALETTE.length], 16), i * 110);
   const last = level >= MAX_LEVEL;
@@ -884,18 +894,18 @@ function openLevels() {
     }
     grid.addEventListener('click', e => {
       const L = +e.target.dataset.l;
-      if (!L || L > best + 1) return;
+      if (!L || L > reach()) return;
       sfx.ui(); closeLevels(); level = L; game.newLevel();
     });
   }
   let cur;
   for (const b of grid.querySelectorAll('.cell')) {
     const L = +b.dataset.l;
-    b.className = 'cell' + (L <= best ? ' done' : L === best + 1 ? ' cur' : ' locked') + (L === level ? ' here' : '');
-    b.disabled = L > best + 1;
+    b.className = 'cell' + (L <= best ? ' done' : L === best + 1 ? ' cur' : L > reach() ? ' locked' : '') + (L === level ? ' here' : '');
+    b.disabled = L > reach();
     if (L === level) cur = b;
   }
-  $('selProg').textContent = `${best} / ${MAX_LEVEL} cleared`;
+  $('selProg').textContent = `${best} / ${MAX_LEVEL} cleared` + (me && me.admin ? ' · admin: all levels open' : '');
   paused = true; $('sel').classList.add('show');
   if (cur) cur.scrollIntoView({ block: 'center' });
 }
@@ -939,7 +949,7 @@ function renderProfiles() {
     const av = document.createElement('span'); av.className = 'av'; av.textContent = initial(p); av.style.setProperty('--k', PALETTE[p.color]);
     const txt = document.createElement('span'); txt.className = 'ptxt';
     const nm = document.createElement('b'); nm.textContent = p.name;
-    const st = document.createElement('small'); st.textContent = (p === me ? 'Playing now · ' : 'Level ' + p.level + ' · ') + p.best + ' / ' + MAX_LEVEL + ' cleared';
+    const st = document.createElement('small'); st.textContent = (p.admin ? 'Admin · ' : '') + (p === me ? 'Playing now · ' : 'Level ' + p.level + ' · ') + p.best + ' / ' + MAX_LEVEL + ' cleared';
     txt.append(nm, st); pick.append(av, txt);
     pick.onclick = () => { sfx.ui(); if (p !== me) useProfile(p); closeProfiles(); };
     const del = document.createElement('button'); del.className = 'pdel'; del.type = 'button'; del.textContent = 'Delete';
@@ -973,10 +983,17 @@ $('pform').addEventListener('submit', e => {
   const p = newProfile(name, newColor); profiles.list.push(p); $('pname').value = ''; msg.textContent = '';
   sfx.ui(); useProfile(p); closeProfiles();
 });
-$('lform').addEventListener('submit', e => {
+$('lform').addEventListener('submit', async e => {
   e.preventDefault();
   const d = decodeSave($('lcode').value), msg = $('lmsg');
   msg.className = 'pmsg';
+  if (!d && me && await isAdminKey($('lcode').value)) { // the admin key turns admin on or off for this player
+    me.admin = !me.admin; if (!me.admin) delete me.admin;
+    adopt(me); saveProfiles(); $('lcode').value = ''; renderMe(); renderProfiles();
+    msg.className = 'pmsg ok';
+    msg.textContent = me.admin ? me.name + ' is now an admin: every level is open in the level grid.' : 'Admin turned off for ' + me.name + '.';
+    return;
+  }
   if (!d) { msg.textContent = "That code isn't right. Check the 6 characters and try again."; return; }
   if (d.best <= me.best) { msg.textContent = me.name + ' has already cleared ' + me.best + ' levels, so nothing changed.'; return; }
   me.color = d.color; adopt(d); saveProfiles(); $('lcode').value = '';
