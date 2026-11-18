@@ -217,11 +217,16 @@
 </div></div>
 <div id="ov"><div class="card"><h2 id="ovT"></h2><p id="ovP"></p><div class="btns" id="ovB"></div></div></div>
 
-<script>
+<script id="gen-src">
 'use strict';
 /* GEN-START */
-// ---------- level generator + solver (deterministic: level N is always the same puzzle) ----------
-const MAX_LEVEL = 1000, HOOKS = 4, MAX_BANDS = 9;
+// ---------- levels, built on the fly from the level number ----------
+// Each level has its own difficulty band. The bands rise with the level number and never overlap.
+// To build level L: start from a puzzle seeded by L, then make small changes that keep it winnable
+// (swap rockets, move a rocket to the next fuse, add or remove a lock or chain, split or merge fuses,
+// add or drop a colour), keeping whichever change moves the difficulty closest to L's band, until it
+// lands inside. Same level number, same steps, same puzzle; and every level is harder than the one before.
+const MAX_LEVEL = 1000, HOOKS = 4, MAX_BANDS = 9, Q = 1e6;
 const PALETTE = ['#ff4d6d', '#ffc300', '#3ddc84', '#3a86ff', '#b967ff', '#00d4e0', '#f4f4ff', '#ff7ad9'];
 const INTRO = { chain: 25, lock: 50, twin: 100 };
 function rng(seed) {
@@ -232,45 +237,48 @@ function rng(seed) {
   r.shuffle = arr => { for (let i = arr.length - 1; i > 0; i--) { const j = r.int(i + 1); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; };
   return r;
 }
-function params(L, r) {
+// difficulty = solver score (how unlikely a random lighting order is to win) + board size
+// (small boards only reach a few scores, so the first levels climb in bigger steps)
+const target = L => 0.49 + 4.6 * Math.pow((L - 1) / (MAX_LEVEL - 1), 0.62) + 0.5 * (1 - Math.exp(-(L - 1) / 5));
+const edge = L => L <= 1 ? -Infinity : L > MAX_LEVEL ? Infinity : Math.round((target(L - 1) + target(L)) / 2 * Q);
+function limits(L) {
+  const upTo = (intro, max, per) => L < intro ? 0 : Math.min(max, 1 + Math.floor((L - intro) / per));
   const kMax = L <= 2 ? L + 1 : Math.min(8, 4 + Math.floor(L / 55));
-  const kMin = L <= 2 ? L + 1 : Math.max(3, Math.min(kMax, 3 + Math.floor(L / 90)));
-  const k = r.range(kMin, kMax);
-  const e = L < 15 ? 0 : r.range(0, Math.min(4, 1 + Math.floor(L / 120)));
-  const T = 3 * (k + e);
-  const avg = L < 10 ? 3 : 2.4 + r() * 1.4;
-  let bands = Math.max(2, Math.min(MAX_BANDS, Math.round(T / avg)));
-  const pick = (intro, max, step) => L < intro ? 0 : L === intro ? 1 : r.range(0, Math.min(max, 1 + Math.floor((L - intro) / step)));
-  const twins = pick(INTRO.twin, 2, 150), chains = pick(INTRO.chain, 3, 120), locks = pick(INTRO.lock, 3, 120);
-  return { k, e, bands, twins, chains, locks };
+  return {
+    kLo: L <= 2 ? L + 1 : Math.max(3, Math.min(kMax, 3 + Math.floor(L / 90))), kMax, kMin: 2,
+    eMax: L < 15 ? 0 : Math.min(4, 1 + Math.floor(L / 120)),
+    chain: [L === INTRO.chain ? 1 : 0, upTo(INTRO.chain, 3, 120)],
+    lock: [L === INTRO.lock ? 1 : 0, upTo(INTRO.lock, 3, 120)],
+    twin: [L === INTRO.twin ? 1 : 0, upTo(INTRO.twin, 2, 150)]
+  };
 }
 // a firing order that never fills the rack, as long as the fuses are lit in the right order
 function safeOrder(counts, r) {
+  const total = counts.reduce((a, b) => a + b, 0);
   for (let tries = 0; tries < 200; tries++) {
     const left = counts.slice(), held = counts.map(() => 0), seq = [];
-    let ok = true;
-    while (seq.length < counts.reduce((a, b) => a + b, 0)) {
+    while (seq.length < total) {
       const opts = [];
       for (let c = 0; c < counts.length; c++) {
         if (!left[c]) continue;
-        const h = (held[c] + 1) % 3, sum = held.reduce((a, b) => a + b, 0) - held[c] + h;
+        const sum = held.reduce((a, b) => a + b, 0) - held[c] + (held[c] + 1) % 3;
         if (sum < HOOKS) opts.push(c);
       }
-      if (!opts.length) { ok = false; break; }
+      if (!opts.length) break;
       const c = opts[r.int(opts.length)];
       seq.push(c); left[c]--; held[c] = (held[c] + 1) % 3;
     }
-    if (ok) return seq;
+    if (seq.length === total) return seq;
   }
   return null;
 }
-// solver: units are things you can light (a twin pair is one unit). state = set of finished units.
-// returns the chance that lighting random available units wins, plus whether any order wins.
+// solver: units are things you can light (a twin pair is one unit); state = set of finished units.
+// returns the chance that lighting random available units wins.
 function solve(lv) {
   const U = lv.units, m = U.length, full = (1 << m) - 1, K = lv.cols.length;
   const memo = new Float64Array(1 << m).fill(-1);
   const countsOf = mask => { const c = new Array(K).fill(0); for (let u = 0; u < m; u++) if (mask >> u & 1) for (const x of U[u].seq) c[x]++; return c; };
-  function run(mask, u) { // light unit u from state mask; returns new mask or -1
+  function run(mask, u) {
     const cnt = countsOf(mask);
     while (true) {
       for (const x of U[u].seq) {
@@ -297,95 +305,174 @@ function solve(lv) {
   }
   return P(0);
 }
-function build(L, seed) {
-  const r = rng(seed);
-  const p = params(L, r);
-  const colIdx = r.shuffle(PALETTE.map((_, i) => i)).slice(0, p.k);
-  const counts = colIdx.map(() => 3);
-  for (let i = 0; i < p.e; i++) counts[r.int(p.k)] += 3;
-  const seq = safeOrder(counts, r);
-  if (!seq) return null;
-  // cut into chunks; twins need a chunk of 4+ that becomes two strands
-  const nChunks = p.bands - p.twins;
-  if (nChunks < 1 || seq.length < nChunks || seq.length > nChunks * 7) return null;
-  const sizes = new Array(nChunks).fill(1);
-  for (let extra = seq.length - nChunks; extra > 0;) { const i = r.int(nChunks); if (sizes[i] < 7) { sizes[i]++; extra--; } }
-  let at = 0; const chunks = sizes.map(z => seq.slice(at, at += z)); // chunks[i] in solution order
-  const kind = chunks.map(() => 'one'), next = chunks.map(() => -1), lock = chunks.map(() => -1);
-  // twins
-  const twinable = r.shuffle(chunks.map((c, i) => i).filter(i => chunks[i].length >= 4));
-  if (twinable.length < p.twins) return null;
-  twinable.slice(0, p.twins).forEach(i => kind[i] = 'twin');
-  // chains: link chunk i -> i+1 (solution order), neither a twin
-  const linkable = r.shuffle(chunks.map((c, i) => i).filter(i => i + 1 < chunks.length && kind[i] === 'one' && kind[i + 1] === 'one'));
-  let madeChains = 0;
-  for (const i of linkable) { if (madeChains >= p.chains) break; next[i] = i + 1; madeChains++; }
-  if (madeChains < p.chains) return null;
-  const isMember = chunks.map((c, i) => next.indexOf(i) >= 0);
-  // locks: on a chunk that is not a chain member, by a colour that bursts earlier in the solution
-  const cum = [], acc = new Array(p.k).fill(0);
-  chunks.forEach((c, i) => { cum.push(acc.slice()); c.forEach(x => acc[x]++); });
-  const lockable = r.shuffle(chunks.map((c, i) => i).filter(i => i > 0 && !isMember[i] && cum[i].some(v => v >= 3)));
-  let madeLocks = 0;
-  for (const i of lockable) {
-    if (madeLocks >= p.locks) break;
-    const opts = cum[i].map((v, c) => v >= 3 ? c : -1).filter(c => c >= 0);
-    // prefer a colour that only just burst, so the lock really constrains
-    opts.sort((a, b) => cum[i][a] - cum[i][b]);
-    lock[i] = opts[r.int(Math.min(2, opts.length))]; madeLocks++;
+// a puzzle in the making: the winning firing order (seq), cut into fuses (sizes), with twins, chain links and locks
+const clone = G => ({ L: G.L, cols: G.cols, seq: G.seq.slice(), sizes: G.sizes.slice(), twin: G.twin.slice(), link: G.link.slice(), lock: G.lock.slice() });
+function lockColours(G, i) { // colours that have burst before fuse i in the winning order
+  const cnt = new Array(G.cols.length).fill(0); let at = 0;
+  for (let j = 0; j < i; j++) for (let z = 0; z < G.sizes[j]; z++) cnt[G.seq[at++]]++;
+  return cnt.map((v, c) => v >= 3 ? c : -1).filter(c => c >= 0);
+}
+function valid(G) {
+  const lim = limits(G.L), n = G.sizes.length, held = G.cols.map(() => 0);
+  let h = 0;
+  for (const c of G.seq) { h -= held[c]; held[c] = (held[c] + 1) % 3; h += held[c]; if (h >= HOOKS) return false; }
+  let sum = 0, twins = 0, chains = 0, locks = 0;
+  for (let i = 0; i < n; i++) {
+    const z = G.sizes[i];
+    if (z < (G.twin[i] ? 4 : 1) || z > 7) return false;
+    sum += z;
+    if (G.twin[i]) twins++;
+    if (G.link[i]) { if (i + 1 >= n || G.twin[i] || G.twin[i + 1] || G.lock[i + 1] >= 0) return false; chains++; }
+    if (G.lock[i] >= 0) locks++;
   }
-  if (madeLocks < p.locks) return null;
-  // units for the solver, and strands for display
-  const units = chunks.map((c, i) => ({ seq: c, next: next[i], lock: lock[i] }));
-  const lv = { L, hooks: HOOKS, cols: colIdx.map(i => PALETTE[i]), units };
-  // display groups: chains become runs of adjacent bands; twins two bands; others one
+  if (sum !== G.seq.length || n + twins > MAX_BANDS || n + twins < 2) return false;
+  if (chains < lim.chain[0] || chains > lim.chain[1] || locks < lim.lock[0] || locks > lim.lock[1] || twins < lim.twin[0] || twins > lim.twin[1]) return false;
+  const cnt = G.cols.map(() => 0); let at = 0;
+  for (let i = 0; i < n; i++) {
+    if (G.lock[i] >= 0 && (cnt[G.lock[i]] < 3 || (i > 0 && G.link[i - 1]))) return false;
+    for (let z = 0; z < G.sizes[i]; z++) cnt[G.seq[at++]]++;
+  }
+  return true;
+}
+function fresh(L, r, kk, ee) {
+  const lim = limits(L);
+  for (let tries = 0; tries < 40; tries++) {
+    const k = kk != null ? kk : r.range(lim.kLo, lim.kMax), e = ee != null ? ee : r.range(0, lim.eMax);
+    const cols = r.shuffle(PALETTE.map((_, i) => i)).slice(0, k), counts = cols.map(() => 3);
+    for (let i = 0; i < e; i++) counts[r.int(k)] += 3;
+    const seq = safeOrder(counts, r);
+    if (!seq) continue;
+    const twinsN = r.range(lim.twin[0], lim.twin[1]), avg = L < 10 ? 3 : 2.4 + r() * 1.4;
+    const n = Math.max(2, Math.min(MAX_BANDS, Math.round(seq.length / avg))) - twinsN;
+    if (n < 1 || seq.length < n || seq.length > n * 7) continue;
+    const sizes = new Array(n).fill(1);
+    for (let extra = seq.length - n; extra > 0;) { const i = r.int(n); if (sizes[i] < 7) { sizes[i]++; extra--; } }
+    const G = { L, cols, seq, sizes, twin: new Array(n).fill(false), link: new Array(n).fill(false), lock: new Array(n).fill(-1) };
+    r.shuffle(sizes.map((z, i) => i).filter(i => sizes[i] >= 4)).slice(0, twinsN).forEach(i => G.twin[i] = true);
+    const chainsN = r.range(lim.chain[0], lim.chain[1]);
+    for (const i of r.shuffle(sizes.map((z, i) => i))) if (G.link.filter(Boolean).length < chainsN && i + 1 < n && !G.twin[i] && !G.twin[i + 1]) G.link[i] = true;
+    const locksN = r.range(lim.lock[0], lim.lock[1]);
+    for (const i of r.shuffle(sizes.map((z, i) => i))) {
+      if (G.lock.filter(c => c >= 0).length >= locksN || (i > 0 && G.link[i - 1])) continue;
+      const opts = lockColours(G, i); if (opts.length) G.lock[i] = opts[r.int(opts.length)];
+    }
+    if (valid(G)) return G;
+  }
+  return null;
+}
+// small changes; each returns the changed copy (checked for validity by the caller)
+const MOVES = [
+  (G, r) => { const i = r.int(G.seq.length - 1); if (G.seq[i] === G.seq[i + 1]) return null; [G.seq[i], G.seq[i + 1]] = [G.seq[i + 1], G.seq[i]]; return G; },
+  (G, r) => { if (G.sizes.length < 2) return null; const i = r.int(G.sizes.length - 1), d = r.int(2) ? 1 : -1; G.sizes[i] += d; G.sizes[i + 1] -= d; return G; },
+  (G, r) => { const i = r.int(G.sizes.length); if (G.lock[i] >= 0) { G.lock[i] = -1; return G; } const o = lockColours(G, i); if (!o.length) return null; G.lock[i] = o[r.int(o.length)]; return G; },
+  (G, r) => { const i = r.int(G.sizes.length); const o = lockColours(G, i); if (G.lock[i] < 0 || o.length < 2) return null; G.lock[i] = o[r.int(o.length)]; return G; },
+  (G, r) => { const i = r.int(G.sizes.length); G.link[i] = !G.link[i]; return G; },
+  (G, r) => { const i = r.int(G.sizes.length); G.twin[i] = !G.twin[i]; return G; },
+  (G, r) => { // split a fuse in two
+    const i = r.int(G.sizes.length), z = G.sizes[i];
+    if (z < 2 || G.twin[i] || G.link[i]) return null;
+    const a = 1 + r.int(z - 1);
+    G.sizes.splice(i, 1, a, z - a); G.twin.splice(i + 1, 0, false); G.link.splice(i + 1, 0, false); G.lock.splice(i + 1, 0, -1); return G;
+  },
+  (G, r) => { // merge a fuse into the next
+    if (G.sizes.length < 2) return null;
+    const i = r.int(G.sizes.length - 1);
+    if (G.twin[i] || G.twin[i + 1] || G.link[i]) return null;
+    G.sizes[i] += G.sizes[i + 1]; G.sizes.splice(i + 1, 1); G.twin.splice(i + 1, 1); G.link.splice(i, 1); G.lock.splice(i + 1, 1); return G;
+  }
+];
+function evaluate(G) {
+  const units = [];
+  let at = 0;
+  G.sizes.forEach((z, i) => { units.push({ seq: G.seq.slice(at, at += z), next: G.link[i] ? i + 1 : -1, lock: G.lock[i] }); });
+  const lv = { hooks: HOOKS, cols: G.cols.map(i => PALETTE[i]), units };
+  const P = solve(lv), D = P > 0 ? -Math.log10(P) : Infinity;
+  const mech = G.link.filter(Boolean).length + G.lock.filter(c => c >= 0).length + G.twin.filter(Boolean).length;
+  const q = Math.round((D + 0.035 * G.seq.length + 0.08 * units.length + 0.06 * G.cols.length + 0.05 * mech) * Q);
+  return { lv, P, D, q };
+}
+function search(L) {
+  const r = rng(L * 7919 + 13), lo = edge(L), hi = edge(L + 1), lim = limits(L);
+  const dist = q => q < lo ? lo - q : q >= hi ? q - hi + 1 : 0;
+  let cur = null, curE = null, evals = 0;
+  for (let i = 0; i < 6; i++) { // a few starting puzzles; keep the closest
+    const G = fresh(L, r); if (!G) continue;
+    const E = evaluate(G); evals++;
+    if (!cur || dist(E.q) < dist(curE.q)) { cur = G; curE = E; }
+  }
+  let best = cur, bestE = curE, stale = 0, sinceBest = 0;
+  for (let step = 0; step < 3000 && dist(curE.q); step++) {
+    if (++sinceBest > 40) { // stuck: start again from a new puzzle of any allowed size
+      const G = fresh(L, r, r.range(lim.kMin, lim.kMax), r.range(0, lim.eMax));
+      if (G) { cur = G; curE = evaluate(G); evals++; }
+      sinceBest = 0;
+    }
+    let pick = null, pickE = null;
+    for (let m = 0; m < 10; m++) {
+      let G;
+      if (m === 0) { // change the size of the board: one colour more or less, or one triple more or less
+        const up = curE.q < lo, k = cur.cols.length, e = (cur.seq.length - 3 * k) / 3, opt = [];
+        if (up) { if (k < lim.kMax) opt.push([k + 1, e]); if (e < lim.eMax) opt.push([k, e + 1]); }
+        else { if (k > lim.kMin) opt.push([k - 1, Math.min(e, lim.eMax)]); if (e > 0) opt.push([k, e - 1]); }
+        if (!opt.length) continue;
+        const [kk, ee] = opt[r.int(opt.length)];
+        G = fresh(L, r, kk, ee);
+      } else G = MOVES[r.int(MOVES.length)](clone(cur), r);
+      if (!G || !valid(G)) continue;
+      const E = evaluate(G); evals++;
+      if (!(E.P > 0)) continue;
+      if (!pick || dist(E.q) < dist(pickE.q)) { pick = G; pickE = E; }
+    }
+    if (!pick) continue;
+    if (dist(pickE.q) <= dist(curE.q) || ++stale > 12) { cur = pick; curE = pickE; stale = 0; } // ties allowed: walk across flat ground
+    if (dist(curE.q) < dist(bestE.q)) { best = cur; bestE = curE; sinceBest = 0; }
+  }
+  return { G: best, E: bestE, inBand: dist(bestE.q) === 0, evals };
+}
+// lay the fuses out on screen: chains become runs of adjacent rows that zigzag, twins two rows side by side
+function layout(G, r) {
+  const n = G.sizes.length, chunks = []; let at = 0;
+  G.sizes.forEach(z => chunks.push(G.seq.slice(at, at += z)));
   const groups = [];
-  chunks.forEach((c, i) => {
-    if (isMember[i]) return;
-    const g = [i]; let j = i; while (next[j] >= 0) { j = next[j]; g.push(j); }
-    groups.push(g);
-  });
+  chunks.forEach((c, i) => { if (i > 0 && G.link[i - 1]) return; const g = [i]; let j = i; while (G.link[j]) g.push(++j); groups.push(g); });
   r.shuffle(groups);
   const strands = [];
   for (const g of groups) {
     let dir = r.int(2);
     for (const i of g) {
       const c = chunks[i];
-      if (kind[i] === 'twin') {
-        const phase = r() * 6.28, A = [], B = [];
-        const side = c.map(() => r.int(2));
+      if (G.twin[i]) {
+        const phase = r() * 6.28, A = [], B = [], side = c.map(() => r.int(2));
         while (side.filter(v => v).length < 2) side[r.int(side.length)] = 1;
         while (side.filter(v => !v).length < 2) side[r.int(side.length)] = 0;
         c.forEach((x, j) => (side[j] ? B : A).push([x, +(0.16 + 0.74 * j / (c.length - 1)).toFixed(3)]));
         const a = strands.length;
-        strands.push({ u: i, rk: A, dir, phase, twin: a + 1, owner: true, lock: lock[i] });
-        strands.push({ u: i, rk: B, dir, phase, twin: a, owner: false });
+        strands.push({ u: i, rk: A, dir, phase, twin: a + 1, owner: true, lock: G.lock[i], next: -1 });
+        strands.push({ u: i, rk: B, dir, phase, twin: a, owner: false, lock: -1, next: -1 });
       } else {
         const rk = c.map((x, q) => [x, c.length === 1 ? 0.55 : +(0.2 + 0.7 * q / (c.length - 1)).toFixed(3)]);
-        strands.push({ u: i, rk, dir, phase: r() * 6.28, owner: true, lock: lock[i], next: next[i] });
-        dir = 1 - dir; // a chain zigzags: the next fuse starts where this one ends
+        strands.push({ u: i, rk, dir, phase: r() * 6.28, owner: true, lock: G.lock[i], next: G.link[i] ? i + 1 : -1, twin: -1 });
+        dir = 1 - dir;
       }
     }
   }
-  // map chain "next" from chunk index to strand index
   const strandOf = {}; strands.forEach((s, si) => { if (s.owner) strandOf[s.u] = si; });
-  strands.forEach(s => { if (s.next >= 0) s.next = strandOf[s.next]; else s.next = -1; if (s.lock == null) s.lock = -1; if (s.twin == null) s.twin = -1; });
-  lv.strands = strands;
-  lv.P = solve(lv);
-  lv.D = lv.P > 0 ? -Math.log10(lv.P) : Infinity;
-  lv.p = p;
-  return lv;
+  strands.forEach(s => { if (s.next >= 0) s.next = strandOf[s.next]; });
+  return strands;
 }
-// levels sorted easiest to hardest: each entry is (source slot * 1000 + attempt), picked offline so every level
-// is harder than the one before it (score = solver difficulty + board size)
-const ORDER = [1000,10013,2141,2027,18155,2004,17043,31075,10000,10091,20197,21067,3033,18000,12021,10012,11015,23077,29005,4010,17114,16033,22177,31033,34029,25154,18095,20191,29044,44130,26005,11000,34188,19142,5003,5124,15024,31088,25013,44157,44175,32022,30086,70032,31182,47079,26038,47154,3039,50004,42133,37110,24015,52015,77118,26057,37107,72124,23063,30015,4072,74093,62167,66162,76135,19161,51048,90151,17113,38162,80083,42012,30187,88036,68167,4066,45038,53109,59158,22005,71004,26039,71151,79020,63074,76089,90109,88052,89064,94032,93116,99141,72115,73135,76064,107072,92037,44166,94193,102144,135122,92144,72176,84167,73039,133102,96048,95081,97004,103114,110031,110042,115063,100060,96095,137056,145157,108017,122184,124045,105090,85015,107047,105062,119075,101081,109037,126040,100125,123060,82008,154031,113165,90117,106071,146018,118013,118088,139096,113092,137029,150094,120018,131112,127017,129083,111131,114062,143082,167016,131079,118002,153116,130070,95115,136005,142020,142003,134054,132176,157108,126026,102004,149130,130090,193159,135071,144070,135102,154092,179128,164008,166141,169006,152093,184152,144026,121039,177028,192178,156156,128056,188129,134111,195194,173119,235011,163188,147065,170145,154033,161094,168178,211069,204144,196013,199149,148049,152036,191190,206189,187078,206071,182102,205113,165006,251137,185167,170139,207067,205097,236062,240085,179112,211010,191065,194044,242195,181114,252028,187176,161154,226016,254131,210050,215049,214094,177086,172061,188049,197041,184175,258150,235124,240121,243106,192177,253036,186060,189107,219077,249151,266077,198034,184038,210096,195112,243098,223112,311062,185073,275059,194031,238151,266124,222049,227136,232004,216027,221069,182019,186130,286049,220150,190025,224051,248017,240042,224153,274195,206047,272185,230079,250115,292165,346172,280156,284183,265191,310154,306093,317119,304165,201135,307146,242069,314099,233015,294086,228138,236099,333097,305058,303179,341093,343053,270081,273117,344122,355184,257000,224199,279174,287118,276116,260190,255058,277192,318057,358161,316083,307119,297016,303018,356144,293065,337093,297130,273095,269036,361123,363045,272173,329111,329121,364191,312149,341031,228107,302091,377060,283033,361156,282011,310028,275097,328062,273197,418172,357037,280064,273164,291061,335006,331002,384032,340030,346101,416132,320003,294174,388199,299140,322120,325027,284182,290181,448117,314007,299176,281115,288178,332104,370150,321044,384161,298197,315022,391195,381032,309023,296005,326165,358156,318048,354053,378148,407124,298004,404078,333136,266069,339179,295060,328054,351064,428020,349004,333001,314116,374132,414135,361117,391159,371092,352046,350199,348066,409073,406059,395060,390160,399119,449093,408024,384061,359129,424072,342013,361191,416192,450042,478170,351158,402038,387148,461131,427071,442100,419085,369152,472177,459110,550032,380072,405070,392146,417008,395046,461106,422067,465120,316087,393040,467152,527079,294089,358163,441193,379062,383010,368064,534078,394190,501151,387129,536037,419039,326001,320040,470097,501078,429025,456162,407092,377091,461008,440183,369071,495082,466189,423179,503035,506124,496127,523126,440035,391099,481197,504097,495050,452074,443038,397067,441189,381146,489038,437161,315064,517028,471094,532164,467057,557145,422018,424053,404084,382033,480073,555091,460088,535031,455027,541003,566167,464060,579148,589010,476198,372028,388008,428044,446076,487093,479145,519175,582142,610027,511030,488042,490017,484193,573120,465075,550177,458102,514133,544090,508001,533148,432149,541001,577000,562025,434124,546066,433190,483068,491136,530119,463106,504122,497049,489103,459034,612085,461137,454011,555082,535157,621089,457008,463047,655119,461046,493152,496106,517083,519195,529023,465105,455108,451115,550146,385190,400190,443009,567046,508061,598052,578056,537102,563066,493002,451148,420157,539145,530134,581116,481111,457000,438072,522130,673038,545082,422008,551035,451190,690031,516051,512045,435140,477094,654151,624137,516097,563017,536166,537138,455159,655059,498108,590088,527169,636106,596045,501155,510064,581156,524127,446135,587066,715181,683088,600144,614186,462172,554145,432053,534011,623046,635063,686066,631122,656094,517147,476127,514064,517072,474026,610130,512163,742087,456093,745005,620182,613061,613035,558158,632148,659124,535104,586079,599001,492170,570137,700103,491050,621121,648166,548054,433187,620174,507030,663077,609085,514018,559002,658103,547197,651164,663056,509145,677174,747010,656185,486151,744072,518117,621074,661130,752180,634122,670179,643050,589029,604016,708041,528114,754119,725173,753018,703032,591053,541117,519030,764133,598186,691135,704088,653150,843036,751186,634188,666164,665185,565054,657166,755118,712090,749083,599172,732192,737148,517143,678187,680089,506082,776161,727130,618017,738185,792000,601121,728157,692073,796094,780014,749198,698101,614131,668027,613125,717086,488027,688115,602194,733190,705102,627032,628112,736063,643039,653151,710120,736151,702001,641028,730151,709146,705009,722063,793051,687185,765005,567012,797100,756108,672097,675110,808101,634085,665076,752071,800022,715021,709162,714064,667174,625113,823198,832021,487022,699093,754022,726129,857057,775063,805052,746000,667183,687098,767016,915139,953186,878142,630077,788004,792085,724083,777134,794109,693119,739156,695081,764104,833157,790198,690041,816106,862122,667153,633064,926059,851113,620134,740078,798069,875032,885064,855056,789070,821043,680044,823139,885180,842002,701093,835096,780050,803137,784038,742179,918198,914112,832062,836041,869014,916017,837033,782137,905032,751024,750020,775041,719158,707097,783093,817095,821156,825016,721163,922051,759149,817182,829083,751193,701040,815013,737042,901081,875160,946117,885170,743063,834005,685133,869051,756061,828128,793012,893100,696102,706004,886015,905083,719037,664014,845118,754092,818154,771102,812078,822118,963054,880194,895061,723103,913170,804134,872043,845167,943006,830184,864112,859030,789093,819082,794011,813111,735124,895008,785146,741085,737073,882007,781137,857058,892129,923114,841098,779127,744071,912010,967175,924199,900065,899029,950141,926125,826045,835093,806060,831045,885136,926090,828008,867000,811150,915116,791141,971042,874033,907010,943169,814134,866062,848054,705166,795032,921005,947165,890137,792181,884132,915066,711057,740096,847117,887131,902084,997084,897129,948051,897128,907158,878197,916088,867138,810031,998056,965052,972191,862147,770156,797157,757019,810160,863037,931151,891016,942080,911107,846063,938067,984058,832082,810112,923086,908101,886135,858107,924155,829011,853022,931068,906113,909110,965089,930194,879057,960024,1000055,990000,825139,928114,913069,952188,956010,919181,912003,995111,919197,922034,920084,996137,991101,925099,902164,961067,919140,975045,892030,926162,987013,986085,840068,977122,926057,945146,889134,911045,988146,992075,966145,927103,924113,999171,994105,970172];
 const levelCache = {};
 function makeLevel(L) {
   if (levelCache[L]) return levelCache[L];
-  const c = ORDER[L - 1], s = Math.floor(c / 1000);
-  return levelCache[L] = build(s, s * 7919 + (c % 1000) * 104729 + 13);
+  const S = search(L), lv = S.E.lv;
+  lv.L = L; lv.P = S.E.P; lv.D = S.E.D; lv.q = S.E.q; lv.inBand = S.inBand; lv.evals = S.evals;
+  lv.p = { chains: S.G.link.filter(Boolean).length, locks: S.G.lock.filter(c => c >= 0).length, twins: S.G.twin.filter(Boolean).length };
+  lv.strands = layout(S.G, rng(L * 7919 + 99991));
+  return levelCache[L] = lv;
 }
 /* GEN-END */
+</script>
+<script>
+'use strict';
 
 /* ---------- shared helpers ---------- */
 const KEY = 'fuse', NS = 'http://www.w3.org/2000/svg';
@@ -556,12 +643,42 @@ const NEW = {
 };
 let LV, strands = [], links = [], rack = [], pending = 0, fired = 0, total = 0, ended = false, paused = false, run = 0, lastT = 0, sizz = null, sizzOn = false;
 
+/* ---------- level builder: runs in a background worker so the game never freezes ---------- */
+let worker = null, want = 0, building = false;
+const waiting = {};
+function settle(L, lv) { levelCache[L] = lv; const cbs = waiting[L] || []; delete waiting[L]; cbs.forEach(f => f(lv)); }
+try {
+  const src = $('gen-src').textContent + '\nonmessage = e => postMessage({ L: e.data, lv: makeLevel(e.data) });';
+  worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+  worker.onmessage = e => settle(e.data.L, e.data.lv);
+  worker.onerror = e => { // no worker here: build on the main thread instead
+    if (e && e.preventDefault) e.preventDefault();
+    worker = null;
+    for (const L of Object.keys(waiting)) settle(+L, makeLevel(+L));
+  };
+} catch (e) { worker = null; }
+function request(L, cb) {
+  if (levelCache[L]) { if (cb) cb(levelCache[L]); return; }
+  if (worker) { const first = !waiting[L]; (waiting[L] = waiting[L] || []).push(cb || (() => {})); if (first) worker.postMessage(L); }
+  else if (cb) setTimeout(() => cb(makeLevel(L)), 30); // let the "building" card paint first
+}
+const prefetch = L => { if (worker && L <= MAX_LEVEL && !levelCache[L]) request(L); };
 function newLevel() {
   level = Math.min(Math.max(1, level), MAX_LEVEL);
-  LV = makeLevel(level);
-  startLevel(TIPS[level] || '');
-  restart();
-  if (NEW[level]) show(NEW[level][0], NEW[level][1], [['Got it', hide]]);
+  const L = level, ticket = ++want;
+  const go = lv => {
+    if (ticket !== want) return; // a newer level was asked for meanwhile
+    building = false; LV = lv;
+    startLevel(TIPS[L] || '');
+    restart();
+    if (NEW[L]) show(NEW[L][0], NEW[L][1], [['Got it', hide]]);
+    prefetch(L + 1);
+  };
+  if (levelCache[L]) return go(levelCache[L]);
+  building = true; ended = true; run++; // freeze whatever was on the board
+  $('lvl').textContent = 'Level ' + L;
+  show('Level ' + L, 'Building a puzzle at exactly the right difficulty…', []);
+  request(L, go);
 }
 function pointAt(s, d) {
   const L = s.cum; let i = 1; while (i < L.length - 1 && L[i] < d) i++;
@@ -878,7 +995,7 @@ $('profX').onclick = () => { sfx.ui(); closeProfiles(); };
 
 /* ---------- boot ---------- */
 if (game.undo) $('undo').onclick = game.undo; else $('undo').style.display = 'none';
-$('restart').onclick = () => { sfx.ui(); game.restart(); };
+$('restart').onclick = () => { if (building) return; sfx.ui(); game.restart(); };
 $('lvl').onclick = () => { sfx.ui(); openLevels(); };
 $('selX').onclick = () => { sfx.ui(); closeLevels(); };
 $('mute').onclick = () => {
