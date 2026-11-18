@@ -239,17 +239,17 @@ function rng(seed) {
 }
 // difficulty = solver score (how unlikely a random lighting order is to win) + board size
 // (small boards only reach a few scores, so the first levels climb in bigger steps)
-const target = L => 0.49 + 4.6 * Math.pow((L - 1) / (MAX_LEVEL - 1), 0.62) + 0.5 * (1 - Math.exp(-(L - 1) / 5));
+const target = L => 0.49 + 5.8 * Math.pow((L - 1) / (MAX_LEVEL - 1), 0.35) + 0.5 * (1 - Math.exp(-(L - 1) / 5));
 const edge = L => L <= 1 ? -Infinity : L > MAX_LEVEL ? Infinity : Math.round((target(L - 1) + target(L)) / 2 * Q);
 function limits(L) {
   const upTo = (intro, max, per) => L < intro ? 0 : Math.min(max, 1 + Math.floor((L - intro) / per));
-  const kMax = L <= 2 ? L + 1 : Math.min(8, 4 + Math.floor(L / 55));
+  const kMax = L <= 2 ? L + 1 : Math.min(8, 4 + Math.floor(L / 30));
   return {
-    kLo: L <= 2 ? L + 1 : Math.max(3, Math.min(kMax, 3 + Math.floor(L / 90))), kMax, kMin: 2,
-    eMax: L < 15 ? 0 : Math.min(4, 1 + Math.floor(L / 120)),
-    chain: [L === INTRO.chain ? 1 : 0, upTo(INTRO.chain, 3, 120)],
-    lock: [L === INTRO.lock ? 1 : 0, upTo(INTRO.lock, 3, 120)],
-    twin: [L === INTRO.twin ? 1 : 0, upTo(INTRO.twin, 2, 150)]
+    kLo: L <= 2 ? L + 1 : Math.max(3, Math.min(kMax, 3 + Math.floor(L / 50))), kMax, kMin: 2,
+    eMax: L < 15 ? 0 : Math.min(4, 1 + Math.floor(L / 60)),
+    chain: [L === INTRO.chain ? 1 : 0, upTo(INTRO.chain, 3, 60)],
+    lock: [L === INTRO.lock ? 1 : 0, upTo(INTRO.lock, 3, 60)],
+    twin: [L === INTRO.twin ? 1 : 0, upTo(INTRO.twin, 2, 100)]
   };
 }
 // a firing order that never fills the rack, as long as the fuses are lit in the right order
@@ -401,7 +401,7 @@ function search(L) {
     if (!cur || dist(E.q) < dist(curE.q)) { cur = G; curE = E; }
   }
   let best = cur, bestE = curE, stale = 0, sinceBest = 0;
-  for (let step = 0; step < 3000 && dist(curE.q); step++) {
+  for (let step = 0; step < 8000 && dist(curE.q); step++) {
     if (++sinceBest > 40) { // stuck: start again from a new puzzle of any allowed size
       const G = fresh(L, r, r.range(lim.kMin, lim.kMax), r.range(0, lim.eMax));
       if (G) { cur = G; curE = evaluate(G); evals++; }
