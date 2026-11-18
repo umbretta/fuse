@@ -113,6 +113,9 @@
   }
   .tok.in { animation: pop-in .25s cubic-bezier(.3,1.8,.5,1); }
   .tok.fly { position: fixed; z-index: 20; pointer-events: none; }
+  .tok.dud { position: relative; box-shadow: 0 4px 10px rgba(0,0,0,.45); }
+  .tok.dud::after { content: '\00d7'; position: absolute; inset: 0; display: grid; place-items: center; font: 900 24px/1 system-ui, sans-serif; color: #2a2838; }
+  .rocket .qm { font: 900 15px/1 system-ui, sans-serif; fill: #fff; text-anchor: middle; pointer-events: none; }
 
   button.pill { cursor: pointer; transition: transform .12s; }
   button.pill:active { transform: scale(.94); }
@@ -224,11 +227,12 @@
 // Each level has its own difficulty band. The bands rise with the level number and never overlap.
 // To build level L: start from a puzzle seeded by L, then make small changes that keep it winnable
 // (swap rockets, move a rocket to the next fuse, add or remove a lock or chain, split or merge fuses,
-// add or drop a colour), keeping whichever change moves the difficulty closest to L's band, until it
-// lands inside. Same level number, same steps, same puzzle; and every level is harder than the one before.
+// add or drop a colour, a dud or a hook), keeping whichever change moves the difficulty closest to L's band,
+// until it lands inside. Same level number, same steps, same puzzle; and every level is harder than the one before.
 const MAX_LEVEL = 1000, HOOKS = 4, MAX_BANDS = 9, Q = 1e6;
 const PALETTE = ['#ff4d6d', '#ffc300', '#3ddc84', '#3a86ff', '#b967ff', '#00d4e0', '#f4f4ff', '#ff7ad9'];
-const INTRO = { chain: 25, lock: 50, twin: 100 };
+const INTRO = { chain: 25, lock: 50, dud: 75, twin: 100, mystery: 125, small: 150 };
+const DUD = -1; // a dud rocket matches nothing; it sits on a hook until the next burst of three knocks it off
 function rng(seed) {
   let a = seed >>> 0;
   const r = () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
@@ -239,7 +243,8 @@ function rng(seed) {
 }
 // difficulty = solver score (how unlikely a random lighting order is to win) + board size
 // (small boards only reach a few scores, so the first levels climb in bigger steps)
-const target = L => 0.49 + 5.8 * Math.pow((L - 1) / (MAX_LEVEL - 1), 0.35) + 0.5 * (1 - Math.exp(-(L - 1) / 5));
+const W = { T: 1, D: 0.35, M: 0.06 };
+const target = L => 0.49 + 6.6 * Math.pow((L - 1) / (MAX_LEVEL - 1), 0.3) + 0.5 * (1 - Math.exp(-(L - 1) / 5));
 const edge = L => L <= 1 ? -Infinity : L > MAX_LEVEL ? Infinity : Math.round((target(L - 1) + target(L)) / 2 * Q);
 function limits(L) {
   const upTo = (intro, max, per) => L < intro ? 0 : Math.min(max, 1 + Math.floor((L - intro) / per));
@@ -249,11 +254,15 @@ function limits(L) {
     eMax: L < 15 ? 0 : Math.min(4, 1 + Math.floor(L / 60)),
     chain: [L === INTRO.chain ? 1 : 0, upTo(INTRO.chain, 3, 60)],
     lock: [L === INTRO.lock ? 1 : 0, upTo(INTRO.lock, 3, 60)],
-    twin: [L === INTRO.twin ? 1 : 0, upTo(INTRO.twin, 2, 100)]
+    twin: [L === INTRO.twin ? 1 : 0, upTo(INTRO.twin, 2, 100)],
+    dud: [L === INTRO.dud ? 1 : 0, upTo(INTRO.dud, 3, 100)],
+    mys: [L === INTRO.mystery ? 1 : 0, L < INTRO.mystery ? 0 : Math.min(8, 2 + Math.floor((L - INTRO.mystery) / 60))],
+    // from level 150 a set share of levels (25% rising to 60%) have a three-hook rack
+    hooks: L < INTRO.small ? [4] : L === INTRO.small || rng(L * 31 + 7)() < 0.25 + 0.35 * (L - INTRO.small) / (MAX_LEVEL - INTRO.small) ? [3] : [4]
   };
 }
 // a firing order that never fills the rack, as long as the fuses are lit in the right order
-function safeOrder(counts, r) {
+function safeOrder(counts, r, hooks) {
   const total = counts.reduce((a, b) => a + b, 0);
   for (let tries = 0; tries < 200; tries++) {
     const left = counts.slice(), held = counts.map(() => 0), seq = [];
@@ -262,60 +271,76 @@ function safeOrder(counts, r) {
       for (let c = 0; c < counts.length; c++) {
         if (!left[c]) continue;
         const sum = held.reduce((a, b) => a + b, 0) - held[c] + (held[c] + 1) % 3;
-        if (sum < HOOKS) opts.push(c);
+        if (sum < hooks) opts.push(c);
       }
-      if (!opts.length) break;
-      const c = opts[r.int(opts.length)];
+      const fits = (h, c) => h.reduce((a, b) => a + b, 0) - h[c] + (h[c] + 1) % 3 < hooks;
+      const live = opts.filter(c => {
+        if (seq.length + 1 === total) return true;
+        const h = held.slice(); h[c] = (h[c] + 1) % 3;
+        return counts.some((_, x) => left[x] - (x === c) > 0 && fits(h, x));
+      });
+      if (!live.length) break;
+      const c = live[r.int(live.length)];
       seq.push(c); left[c]--; held[c] = (held[c] + 1) % 3;
     }
     if (seq.length === total) return seq;
   }
   return null;
 }
-// solver: units are things you can light (a twin pair is one unit); state = set of finished units.
-// returns the chance that lighting random available units wins.
+// solver: units are things you can light (a twin pair is one unit); state = set of finished units plus
+// the duds on the rack. Returns two chances of winning: lighting any unit at random (P), and a careful player who
+// never lights a fuse that overflows the rack on its own (Ps). Losses the careful player still walks into are traps.
 function solve(lv) {
   const U = lv.units, m = U.length, full = (1 << m) - 1, K = lv.cols.length;
-  const memo = new Float64Array(1 << m).fill(-1);
-  const countsOf = mask => { const c = new Array(K).fill(0); for (let u = 0; u < m; u++) if (mask >> u & 1) for (const x of U[u].seq) c[x]++; return c; };
-  function run(mask, u) {
+  const memoR = new Float64Array(4 << m).fill(-1), memoS = new Float64Array(4 << m).fill(-1);
+  const countsOf = mask => { const c = new Array(K).fill(0); for (let u = 0; u < m; u++) if (mask >> u & 1) for (const x of U[u].seq) if (x >= 0) c[x]++; return c; };
+  function run(mask, d, u) {
     const cnt = countsOf(mask);
     while (true) {
       for (const x of U[u].seq) {
-        cnt[x]++;
-        let held = 0; for (let c = 0; c < K; c++) held += cnt[c] % 3;
+        if (x < 0) d++; else if (++cnt[x] % 3 === 0) d = 0;
+        let held = d; for (let c = 0; c < K; c++) held += cnt[c] % 3;
         if (held >= lv.hooks) return -1;
       }
       mask |= 1 << u;
       const nx = U[u].next;
-      if (nx < 0 || (mask >> nx & 1)) return mask;
+      if (nx < 0 || (mask >> nx & 1)) return mask * 4 + d;
       u = nx;
     }
   }
-  function P(mask) {
-    if (mask === full) return 1;
-    if (memo[mask] >= 0) return memo[mask];
-    const cnt = countsOf(mask); let n = 0, s = 0;
+  function P(st) {
+    const mask = st >> 2;
+    if (mask === full) return [1, 1];
+    if (memoR[st] >= 0) return [memoR[st], memoS[st]];
+    const cnt = countsOf(mask); let n = 0, sr = 0, ns = 0, ss = 0;
     for (let u = 0; u < m; u++) {
       if (mask >> u & 1) continue;
       if (U[u].lock >= 0 && cnt[U[u].lock] < 3) continue;
-      n++; const nm = run(mask, u); if (nm >= 0) s += P(nm);
+      n++; const nx = run(mask, st & 3, u);
+      if (nx >= 0) { const [r, c] = P(nx); sr += r; ns++; ss += c; }
     }
-    return memo[mask] = n ? s / n : 0;
+    memoR[st] = n ? sr / n : 0; memoS[st] = ns ? ss / ns : 0;
+    return [memoR[st], memoS[st]];
   }
   return P(0);
 }
 // a puzzle in the making: the winning firing order (seq), cut into fuses (sizes), with twins, chain links and locks
-const clone = G => ({ L: G.L, cols: G.cols, seq: G.seq.slice(), sizes: G.sizes.slice(), twin: G.twin.slice(), link: G.link.slice(), lock: G.lock.slice() });
+const clone = G => ({ L: G.L, cols: G.cols, hooks: G.hooks, mys: G.mys, seq: G.seq.slice(), sizes: G.sizes.slice(), twin: G.twin.slice(), link: G.link.slice(), lock: G.lock.slice() });
 function lockColours(G, i) { // colours that have burst before fuse i in the winning order
   const cnt = new Array(G.cols.length).fill(0); let at = 0;
-  for (let j = 0; j < i; j++) for (let z = 0; z < G.sizes[j]; z++) cnt[G.seq[at++]]++;
+  for (let j = 0; j < i; j++) for (let z = 0; z < G.sizes[j]; z++) { const x = G.seq[at++]; if (x >= 0) cnt[x]++; }
   return cnt.map((v, c) => v >= 3 ? c : -1).filter(c => c >= 0);
 }
 function valid(G) {
   const lim = limits(G.L), n = G.sizes.length, held = G.cols.map(() => 0);
-  let h = 0;
-  for (const c of G.seq) { h -= held[c]; held[c] = (held[c] + 1) % 3; h += held[c]; if (h >= HOOKS) return false; }
+  if (!lim.hooks.includes(G.hooks)) return false;
+  let h = 0, d = 0, duds = 0;
+  for (const c of G.seq) {
+    if (c < 0) { d++; duds++; } else { h -= held[c]; held[c] = (held[c] + 1) % 3; h += held[c]; if (!held[c]) d = 0; }
+    if (h + d >= G.hooks) return false;
+  }
+  if (G.probe) return true; // only the rack check matters while duds are being placed
+  if (duds < lim.dud[0] || duds > lim.dud[1] || G.mys < lim.mys[0] || G.mys > lim.mys[1] || G.mys > G.seq.length - duds) return false;
   let sum = 0, twins = 0, chains = 0, locks = 0;
   for (let i = 0; i < n; i++) {
     const z = G.sizes[i];
@@ -330,7 +355,7 @@ function valid(G) {
   const cnt = G.cols.map(() => 0); let at = 0;
   for (let i = 0; i < n; i++) {
     if (G.lock[i] >= 0 && (cnt[G.lock[i]] < 3 || (i > 0 && G.link[i - 1]))) return false;
-    for (let z = 0; z < G.sizes[i]; z++) cnt[G.seq[at++]]++;
+    for (let z = 0; z < G.sizes[i]; z++) { const x = G.seq[at++]; if (x >= 0) cnt[x]++; }
   }
   return true;
 }
@@ -340,14 +365,20 @@ function fresh(L, r, kk, ee) {
     const k = kk != null ? kk : r.range(lim.kLo, lim.kMax), e = ee != null ? ee : r.range(0, lim.eMax);
     const cols = r.shuffle(PALETTE.map((_, i) => i)).slice(0, k), counts = cols.map(() => 3);
     for (let i = 0; i < e; i++) counts[r.int(k)] += 3;
-    const seq = safeOrder(counts, r);
+    const hooks = lim.hooks[r.int(lim.hooks.length)], seq = safeOrder(counts, r, hooks);
     if (!seq) continue;
+    const dudsN = r.range(lim.dud[0], lim.dud[1]);
+    for (let dn = 0; dn < dudsN; dn++) for (let t = 0; t < 20; t++) { // a spot where the winning order still has room for it
+      const p = r.int(seq.length + 1); seq.splice(p, 0, DUD);
+      if (valid({ L, hooks, cols, seq, sizes: [], probe: true })) break;
+      seq.splice(p, 1);
+    }
     const twinsN = r.range(lim.twin[0], lim.twin[1]), avg = L < 10 ? 3 : 2.4 + r() * 1.4;
     const n = Math.max(2, Math.min(MAX_BANDS, Math.round(seq.length / avg))) - twinsN;
     if (n < 1 || seq.length < n || seq.length > n * 7) continue;
     const sizes = new Array(n).fill(1);
     for (let extra = seq.length - n; extra > 0;) { const i = r.int(n); if (sizes[i] < 7) { sizes[i]++; extra--; } }
-    const G = { L, cols, seq, sizes, twin: new Array(n).fill(false), link: new Array(n).fill(false), lock: new Array(n).fill(-1) };
+    const G = { L, cols, hooks, mys: r.range(lim.mys[0], lim.mys[1]), seq, sizes, twin: new Array(n).fill(false), link: new Array(n).fill(false), lock: new Array(n).fill(-1) };
     r.shuffle(sizes.map((z, i) => i).filter(i => sizes[i] >= 4)).slice(0, twinsN).forEach(i => G.twin[i] = true);
     const chainsN = r.range(lim.chain[0], lim.chain[1]);
     for (const i of r.shuffle(sizes.map((z, i) => i))) if (G.link.filter(Boolean).length < chainsN && i + 1 < n && !G.twin[i] && !G.twin[i + 1]) G.link[i] = true;
@@ -374,6 +405,19 @@ const MOVES = [
     const a = 1 + r.int(z - 1);
     G.sizes.splice(i, 1, a, z - a); G.twin.splice(i + 1, 0, false); G.link.splice(i + 1, 0, false); G.lock.splice(i + 1, 0, -1); return G;
   },
+  (G, r) => { // add a dud
+    const p = r.int(G.seq.length + 1); let at = 0, i = 0;
+    while (i < G.sizes.length - 1 && at + G.sizes[i] < p) at += G.sizes[i++];
+    G.seq.splice(p, 0, DUD); G.sizes[i]++; return G;
+  },
+  (G, r) => { // remove a dud
+    const ds = G.seq.map((x, j) => x < 0 ? j : -1).filter(j => j >= 0); if (!ds.length) return null;
+    const p = ds[r.int(ds.length)]; let at = 0, i = 0;
+    while (at + G.sizes[i] <= p) at += G.sizes[i++];
+    G.seq.splice(p, 1); G.sizes[i]--; return G;
+  },
+  G => { G.hooks = 7 - G.hooks; return G; }, // three hooks or four
+  (G, r) => { G.mys += r.int(2) ? 1 : -1; return G; }, // one mystery rocket more or less
   (G, r) => { // merge a fuse into the next
     if (G.sizes.length < 2) return null;
     const i = r.int(G.sizes.length - 1);
@@ -385,11 +429,11 @@ function evaluate(G) {
   const units = [];
   let at = 0;
   G.sizes.forEach((z, i) => { units.push({ seq: G.seq.slice(at, at += z), next: G.link[i] ? i + 1 : -1, lock: G.lock[i] }); });
-  const lv = { hooks: HOOKS, cols: G.cols.map(i => PALETTE[i]), units };
-  const P = solve(lv), D = P > 0 ? -Math.log10(P) : Infinity;
-  const mech = G.link.filter(Boolean).length + G.lock.filter(c => c >= 0).length + G.twin.filter(Boolean).length;
-  const q = Math.round((D + 0.035 * G.seq.length + 0.08 * units.length + 0.06 * G.cols.length + 0.05 * mech) * Q);
-  return { lv, P, D, q };
+  const lv = { hooks: G.hooks, cols: G.cols.map(i => PALETTE[i]), units };
+  const [P, Ps] = solve(lv), D = P > 0 ? -Math.log10(P) : Infinity, T = Ps > 0 ? -Math.log10(Ps) : Infinity;
+  const mech = G.link.filter(Boolean).length + G.lock.filter(c => c >= 0).length + G.twin.filter(Boolean).length + G.seq.filter(x => x < 0).length;
+  const q = Math.round((W.T * T + W.D * D + 0.035 * G.seq.length + 0.08 * units.length + 0.06 * G.cols.length + 0.05 * mech + W.M * G.mys) * Q);
+  return { lv, P, Ps, D, T, q };
 }
 function search(L) {
   const r = rng(L * 7919 + 13), lo = edge(L), hi = edge(L + 1), lim = limits(L);
@@ -432,7 +476,9 @@ function search(L) {
 // lay the fuses out on screen: chains become runs of adjacent rows that zigzag, twins two rows side by side
 function layout(G, r) {
   const n = G.sizes.length, chunks = []; let at = 0;
-  G.sizes.forEach(z => chunks.push(G.seq.slice(at, at += z)));
+  const real = r.shuffle(G.seq.map((x, j) => x >= 0 ? j : -1).filter(j => j >= 0)), hide = new Set(real.slice(0, G.mys));
+  const starts = []; G.sizes.forEach(z => { starts.push(at); chunks.push(G.seq.slice(at, at += z)); });
+  const m = (i, j) => hide.has(starts[i] + j) ? 1 : 0;
   const groups = [];
   chunks.forEach((c, i) => { if (i > 0 && G.link[i - 1]) return; const g = [i]; let j = i; while (G.link[j]) g.push(++j); groups.push(g); });
   r.shuffle(groups);
@@ -445,12 +491,12 @@ function layout(G, r) {
         const phase = r() * 6.28, A = [], B = [], side = c.map(() => r.int(2));
         while (side.filter(v => v).length < 2) side[r.int(side.length)] = 1;
         while (side.filter(v => !v).length < 2) side[r.int(side.length)] = 0;
-        c.forEach((x, j) => (side[j] ? B : A).push([x, +(0.16 + 0.74 * j / (c.length - 1)).toFixed(3)]));
+        c.forEach((x, j) => (side[j] ? B : A).push([x, +(0.16 + 0.74 * j / (c.length - 1)).toFixed(3), m(i, j)]));
         const a = strands.length;
         strands.push({ u: i, rk: A, dir, phase, twin: a + 1, owner: true, lock: G.lock[i], next: -1 });
         strands.push({ u: i, rk: B, dir, phase, twin: a, owner: false, lock: -1, next: -1 });
       } else {
-        const rk = c.map((x, q) => [x, c.length === 1 ? 0.55 : +(0.2 + 0.7 * q / (c.length - 1)).toFixed(3)]);
+        const rk = c.map((x, q) => [x, c.length === 1 ? 0.55 : +(0.2 + 0.7 * q / (c.length - 1)).toFixed(3), m(i, q)]);
         strands.push({ u: i, rk, dir, phase: r() * 6.28, owner: true, lock: G.lock[i], next: G.link[i] ? i + 1 : -1, twin: -1 });
         dir = 1 - dir;
       }
@@ -464,8 +510,8 @@ const levelCache = {};
 function makeLevel(L) {
   if (levelCache[L]) return levelCache[L];
   const S = search(L), lv = S.E.lv;
-  lv.L = L; lv.P = S.E.P; lv.D = S.E.D; lv.q = S.E.q; lv.inBand = S.inBand; lv.evals = S.evals;
-  lv.p = { chains: S.G.link.filter(Boolean).length, locks: S.G.lock.filter(c => c >= 0).length, twins: S.G.twin.filter(Boolean).length };
+  lv.L = L; lv.P = S.E.P; lv.Ps = S.E.Ps; lv.T = S.E.T; lv.D = S.E.D; lv.q = S.E.q; lv.inBand = S.inBand; lv.evals = S.evals;
+  lv.p = { chains: S.G.link.filter(Boolean).length, locks: S.G.lock.filter(c => c >= 0).length, twins: S.G.twin.filter(Boolean).length, duds: S.G.seq.filter(x => x < 0).length, mystery: S.G.mys, hooks: S.G.hooks };
   lv.strands = layout(S.G, rng(L * 7919 + 99991));
   return levelCache[L] = lv;
 }
@@ -644,13 +690,20 @@ const TIPS = {
   2: 'Three of a colour burst. Four in the sky with no match and you lose.',
   [INTRO.chain]: 'Chain fuse: when a fuse burns out, it lights the next one. You can still light that one yourself first.',
   [INTRO.lock]: 'Locked fuse: it opens once a burst of its colour goes off.',
-  [INTRO.twin]: 'Twin fuse: one spark lights both strands. Rockets fire in the order the two flames reach them.'
+  [INTRO.twin]: 'Twin fuse: one spark lights both strands. Rockets fire in the order the two flames reach them.',
+  [INTRO.dud]: 'Dud: a grey rocket matches nothing. It holds a hook until the next burst of three.',
+  [INTRO.mystery]: 'Mystery rocket: its colour shows once its fuse is lit. Every colour comes in threes.',
+  [INTRO.small]: 'Small rack: three hooks, so at most two loose rockets.'
 };
 const NEW = {
   [INTRO.chain]: ['New: chain fuses', 'When a chained fuse burns out, the flame runs on and lights the next fuse. Light the next one yourself first if you want it sooner.'],
   [INTRO.lock]: ['New: locked fuses', 'A padlocked spark shows a colour. It opens once three rockets of that colour burst.'],
-  [INTRO.twin]: ['New: twin fuses', 'One spark lights two strands at once. Both flames burn at the same speed, so follow them side by side.']
+  [INTRO.twin]: ['New: twin fuses', 'One spark lights two strands at once. Both flames burn at the same speed, so follow them side by side.'],
+  [INTRO.dud]: ['New: dud rockets', 'A grey dud matches nothing. It takes a hook when it fires and stays there until the next burst of three knocks it off.'],
+  [INTRO.mystery]: ['New: mystery rockets', 'A rocket marked ? hides its colour until its fuse is lit. Every colour still comes in threes, so count the ones you can see.'],
+  [INTRO.small]: ['New: small racks', 'Some racks have only three hooks. Three rockets up with no match and you lose, so you can hold at most two loose rockets.']
 };
+const DUD_COL = '#8d8aa3', MYS_COL = '#4a4360';
 let LV, strands = [], links = [], rack = [], pending = 0, fired = 0, total = 0, ended = false, paused = false, run = 0, lastT = 0, sizz = null, sizzOn = false;
 
 /* ---------- level builder: runs in a background worker so the game never freezes ---------- */
@@ -679,7 +732,7 @@ function newLevel() {
   const go = lv => {
     if (ticket !== want) return; // a newer level was asked for meanwhile
     building = false; LV = lv;
-    startLevel(TIPS[L] || '');
+    startLevel(TIPS[L] || (lv.hooks === 3 ? 'Small rack: three hooks, so at most two loose rockets.' : ''));
     restart();
     if (NEW[L]) show(NEW[L][0], NEW[L][1], [['Got it', hide]]);
     prefetch(L + 1);
@@ -721,15 +774,18 @@ function restart() {
     const path = 'M' + s.pts.map(p => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join('L');
     gAsh.append(el('path', { d: path, class: 'ash' }));
     s.fuse = el('path', { d: path, class: 'fuse', 'stroke-dasharray': s.len + ' ' + s.len }); gFuse.append(s.fuse);
-    s.rockets = d.rk.map(([c, f]) => {
-      const color = LV.cols[c], [x, y] = pointAt(s, f * s.len);
+    s.rockets = d.rk.map(([c, f, hid]) => {
+      const color = c < 0 ? DUD_COL : LV.cols[c], [x, y] = pointAt(s, f * s.len);
       const g = el('g', { class: 'rocket', transform: `translate(${x.toFixed(1)} ${y.toFixed(1)}) scale(${sc.toFixed(3)})` });
       g.append(el('line', { x1: 0, y1: 0, x2: 0, y2: -9, class: 'stub' }),
                el('path', { d: 'M-6 -9 L-10 -5 L-6 -15 Z M6 -9 L10 -5 L6 -15 Z', fill: 'rgba(255,255,255,.8)' }),
-               el('path', { d: 'M0 -36 C8 -29 8 -16 6 -9 H-6 C-8 -16 -8 -29 0 -36 Z', fill: color }),
-               el('circle', { cx: 0, cy: -23, r: 3, fill: 'rgba(255,255,255,.85)' }));
+               el('path', { d: 'M0 -36 C8 -29 8 -16 6 -9 H-6 C-8 -16 -8 -29 0 -36 Z', fill: hid ? MYS_COL : color }));
+      const body = g.lastChild; let qm = null;
+      if (c < 0) g.append(el('path', { d: 'M-3.5 -26.5 L3.5 -19.5 M3.5 -26.5 L-3.5 -19.5', stroke: '#2a2838', 'stroke-width': 2.6, 'stroke-linecap': 'round' }));
+      else if (hid) { qm = el('text', { x: 0, y: -17.5, class: 'qm' }); qm.textContent = '?'; g.append(qm); }
+      else g.append(el('circle', { cx: 0, cy: -23, r: 3, fill: 'rgba(255,255,255,.85)' }));
       gRock.append(g);
-      return { f, color, g, fired: false };
+      return { f, color, g, fired: false, hid: !!hid, body, qm };
     });
     s.spark = el('circle', { r: 6, class: 'spark' }); gSpark.append(s.spark);
     return s;
@@ -767,14 +823,14 @@ function restart() {
 }
 function renderRack(popLast) {
   foot.textContent = '';
-  for (let i = 0; i < HOOKS; i++) {
+  for (let i = 0; i < LV.hooks; i++) {
     const s = document.createElement('div'); s.className = 'slot';
     if (rack[i]) s.append(token(rack[i], popLast && i === rack.length - 1 ? 'in' : ''));
     foot.append(s);
   }
-  foot.classList.toggle('warn', rack.length === HOOKS - 1);
+  foot.classList.toggle('warn', rack.length === LV.hooks - 1);
 }
-function token(color, cls) { const t = document.createElement('div'); t.className = 'tok ' + cls; t.style.setProperty('--k', color); return t; }
+function token(color, cls) { const t = document.createElement('div'); t.className = 'tok ' + cls + (color === DUD_COL ? ' dud' : ''); t.style.setProperty('--k', color); return t; }
 function light(s, auto) {
   if (ended || paused || s.lit) return;
   audio();
@@ -783,7 +839,13 @@ function light(s, auto) {
     const ib = s.ign.firstChild; ib.classList.remove('shake'); void ib.getBBox(); ib.classList.add('shake');
     return;
   }
-  for (const t of s.partner ? [s, s.partner] : [s]) { t.lit = true; t.spark.classList.add('on'); }
+  for (const t of s.partner ? [s, s.partner] : [s]) {
+    t.lit = true; t.spark.classList.add('on');
+    for (const r of t.rockets) if (r.hid) { // lighting a fuse shows its mystery rockets
+      r.hid = false; r.body.setAttribute('fill', r.color); r.qm.remove();
+      r.g.append(el('circle', { cx: 0, cy: -23, r: 3, fill: 'rgba(255,255,255,.85)' }));
+    }
+  }
   if (s.ign) s.ign.classList.add('lit');
   if (s.forks) s.forks.forEach(f => f.setAttribute('class', 'ash'));
   whoosh(.18, 3000, 6000, auto ? .18 : .3); tone(300, .12, { to: 900, type: 'triangle', v: .12 }); // match strike
@@ -791,7 +853,7 @@ function light(s, auto) {
 function fire(r) {
   r.fired = true; fired++; r.g.classList.add('gone');
   tone(520, .32, { to: 2100, type: 'triangle', v: .13 }); whoosh(.3, 800, 4000, .14); // whistle
-  const [x, y] = center(r.g), slot = foot.children[Math.min(rack.length + pending, HOOKS - 1)], [tx, ty] = center(slot);
+  const [x, y] = center(r.g), slot = foot.children[Math.min(rack.length + pending, LV.hooks - 1)], [tx, ty] = center(slot);
   burst(x, y, '#ffd27a', 6);
   const t = token(r.color, 'fly'); t.style.left = x - 20 + 'px'; t.style.top = y - 20 + 'px'; document.body.append(t);
   pending++; const mine = run; // a restart mid-flight must not land this rocket in the new game
@@ -812,14 +874,14 @@ function unlock(color) {
 function land(color) {
   if (ended) return;
   rack.push(color); renderRack(true); sfx.pop(440 + rack.length * 70);
-  if (rack.filter(c => c === color).length === 3) {
-    [...foot.children].forEach((s, i) => { if (rack[i] === color) burst(...center(s), color, 16); });
-    rack = rack.filter(c => c !== color);
+  if (color !== DUD_COL && rack.filter(c => c === color).length === 3) {
+    [...foot.children].forEach((s, i) => { if (rack[i] === color) burst(...center(s), color, 16); else if (rack[i] === DUD_COL) burst(...center(s), DUD_COL, 6); });
+    rack = rack.filter(c => c !== color && c !== DUD_COL); // the burst knocks every dud off too
     sfx.clear(); whoosh(.35, 300, 2500, .3); tone(110, .25, { to: 50, v: .4 }); // firework bang
     unlock(color);
     setTimeout(() => { if (!ended) renderRack(); }, 160);
   }
-  if (rack.length >= HOOKS) { ended = true; lose('Sky full!', 'Four rockets up and no match of three.'); }
+  if (rack.length >= LV.hooks) { ended = true; lose('Sky full!', 'All ' + LV.hooks + ' hooks are taken and nothing matches.'); }
   else if (fired === total && !pending) { ended = true; win('Grand finale!'); }
   else checkStuck();
 }
